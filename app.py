@@ -13,10 +13,10 @@ import os
 # ─── Restormer Architecture (matches checkpoint key names exactly) ────────────
 
 class LayerNorm(nn.Module):
-    """Channel-first LayerNorm. Checkpoint key: norm1.norm / norm2.norm"""
+    """Channel-first LayerNorm — checkpoint key: norm1.norm / norm2.norm"""
     def __init__(self, dim):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)   # key = .norm  (not .body)
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
         h, w = x.shape[-2:]
@@ -24,12 +24,12 @@ class LayerNorm(nn.Module):
 
 
 class GDFN(nn.Module):
-    """Gated-Dconv FFN — bias=True, sub-layer named .dwconv"""
+    """Gated-Dconv FFN — bias=True, depthwise named .dwconv"""
     def __init__(self, channels, ffn_expansion_factor=2.66):
         super().__init__()
         hidden = int(channels * ffn_expansion_factor)
         self.project_in  = nn.Conv2d(channels, hidden * 2, 1, bias=True)
-        self.dwconv      = nn.Conv2d(hidden * 2, hidden * 2, 3, 1, 1,   # key = .dwconv
+        self.dwconv      = nn.Conv2d(hidden * 2, hidden * 2, 3, 1, 1,
                                      groups=hidden * 2, bias=True)
         self.project_out = nn.Conv2d(hidden, channels, 1, bias=True)
 
@@ -40,13 +40,13 @@ class GDFN(nn.Module):
 
 
 class MDTA(nn.Module):
-    """Multi-Dconv Head Transposed Attention — bias=True, dw named .dwconv"""
+    """Multi-Dconv Head Transposed Attention — bias=True, depthwise named .dwconv"""
     def __init__(self, channels, num_heads):
         super().__init__()
         self.num_heads   = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
         self.qkv         = nn.Conv2d(channels, channels * 3, 1, bias=True)
-        self.dwconv      = nn.Conv2d(channels * 3, channels * 3, 3, 1, 1,  # key = .dwconv
+        self.dwconv      = nn.Conv2d(channels * 3, channels * 3, 3, 1, 1,
                                      groups=channels * 3, bias=True)
         self.project_out = nn.Conv2d(channels, channels, 1, bias=True)
 
@@ -54,18 +54,14 @@ class MDTA(nn.Module):
         b, c, h, w = x.shape
         qkv = self.dwconv(self.qkv(x))
         q, k, v = qkv.chunk(3, dim=1)
-
         q = q.reshape(b, self.num_heads, -1, h * w)
         k = k.reshape(b, self.num_heads, -1, h * w)
         v = v.reshape(b, self.num_heads, -1, h * w)
-
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
-
         attn = (q @ k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
-        out  = (attn @ v).reshape(b, -1, h, w)
-        return self.project_out(out)
+        return self.project_out((attn @ v).reshape(b, -1, h, w))
 
 
 class TransformerBlock(nn.Module):
@@ -83,17 +79,17 @@ class TransformerBlock(nn.Module):
 
 
 class Downsample(nn.Module):
-    """Single Conv2d downsample — checkpoint key: downN.body"""
+    """stride-2 Conv2d, kernel=3 — checkpoint key: downN.body  shape [out,in,3,3]"""
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.body = nn.Conv2d(in_ch, out_ch, 4, 2, 1, bias=True)
+        self.body = nn.Conv2d(in_ch, out_ch, 3, 2, 1, bias=True)
 
     def forward(self, x):
         return self.body(x)
 
 
 class Upsample(nn.Module):
-    """Single Conv2d upsample — checkpoint key: upN.body"""
+    """ConvTranspose2d 2x — checkpoint key: upN.body  shape [in,out,2,2]"""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.body = nn.ConvTranspose2d(in_ch, out_ch, 2, 2, bias=True)
@@ -104,47 +100,49 @@ class Upsample(nn.Module):
 
 class Restormer(nn.Module):
     """
-    Custom Restormer variant matching checkpoint keys:
-      patch_embed  (flat Conv2d, no .proj wrapper)
-      encoder1/2/3, down1/2/3
-      latent (10 blocks)
-      up3/2/1, decoder3/2/1
-      output  (with bias)
-      NO reduce_chan — skip connections added directly (same channel width after up)
-      NO refinement block
+    Custom Restormer matching checkpoint exactly:
+      - patch_embed: flat Conv2d (no .proj wrapper)
+      - encoder1/2/3 with heads 2/4/8
+      - down1/2/3: Conv2d(k=3, stride=2), doubles channels
+      - latent: 10 blocks, heads=8, channels=dim*8
+      - up3/2/1: ConvTranspose2d, halves channels
+      - decoder3/2/1 with heads 8/4/2 — skip via ADDITION (not concat)
+      - output: Conv2d with bias, input=dim channels
+      - no reduce_chan, no refinement block
     """
     def __init__(self, inp_channels=1, out_channels=1, dim=64):
         super().__init__()
-        # patch embed — key: patch_embed.weight / patch_embed.bias
+        # patch_embed.weight / patch_embed.bias
         self.patch_embed = nn.Conv2d(inp_channels, dim, 3, 1, 1, bias=True)
 
-        # Encoder
-        self.encoder1 = nn.Sequential(*[TransformerBlock(dim,      1) for _ in range(4)])
-        self.down1    = Downsample(dim,      dim * 2)
+        # Encoder: channels dim -> dim*2 -> dim*4 -> dim*8
+        self.encoder1 = nn.Sequential(*[TransformerBlock(dim,      2) for _ in range(4)])
+        self.down1    = Downsample(dim,     dim * 2)   # [128,64,3,3]
 
-        self.encoder2 = nn.Sequential(*[TransformerBlock(dim * 2,  2) for _ in range(6)])
-        self.down2    = Downsample(dim * 2,  dim * 4)
+        self.encoder2 = nn.Sequential(*[TransformerBlock(dim * 2,  4) for _ in range(6)])
+        self.down2    = Downsample(dim * 2, dim * 4)   # [256,128,3,3]
 
-        self.encoder3 = nn.Sequential(*[TransformerBlock(dim * 4,  4) for _ in range(8)])
-        self.down3    = Downsample(dim * 4,  dim * 8)
+        self.encoder3 = nn.Sequential(*[TransformerBlock(dim * 4,  8) for _ in range(8)])
+        self.down3    = Downsample(dim * 4, dim * 8)   # [512,256,3,3]
 
-        # Bottleneck
+        # Bottleneck: 10 blocks, dim*8, heads=8
         self.latent   = nn.Sequential(*[TransformerBlock(dim * 8,  8) for _ in range(10)])
 
-        # Decoder — up brings dim*8 → dim*4, then cat with skip → dim*8,
-        # but checkpoint has NO reduce_chan, so decoder operates on dim*8 after cat.
-        # Sizes verified from checkpoint: decoder3 blocks have dim*8 channels,
-        # decoder2 blocks have dim*4, decoder1 blocks have dim*2.
-        self.up3      = Upsample(dim * 8,  dim * 4)
-        self.decoder3 = nn.Sequential(*[TransformerBlock(dim * 8,  4) for _ in range(8)])
+        # Decoder: skip connections via ADDITION (same channel count, no cat/reduce)
+        # up3: dim*8 -> dim*4; add e3(dim*4) -> dim*4 -> decoder3(dim*4, heads=8)
+        self.up3      = Upsample(dim * 8, dim * 4)     # [512,256,2,2]  no error -> correct
+        self.decoder3 = nn.Sequential(*[TransformerBlock(dim * 4,  8) for _ in range(8)])
 
-        self.up2      = Upsample(dim * 8,  dim * 2)
-        self.decoder2 = nn.Sequential(*[TransformerBlock(dim * 4,  2) for _ in range(6)])
+        # up2: dim*4 -> dim*2; add e2(dim*2) -> dim*2 -> decoder2(dim*2, heads=4)
+        self.up2      = Upsample(dim * 4, dim * 2)     # [256,128,2,2]
+        self.decoder2 = nn.Sequential(*[TransformerBlock(dim * 2,  4) for _ in range(6)])
 
-        self.up1      = Upsample(dim * 4,  dim)
-        self.decoder1 = nn.Sequential(*[TransformerBlock(dim * 2,  1) for _ in range(4)])
+        # up1: dim*2 -> dim;   add e1(dim)   -> dim   -> decoder1(dim, heads=2)
+        self.up1      = Upsample(dim * 2, dim)         # [128,64,2,2]
+        self.decoder1 = nn.Sequential(*[TransformerBlock(dim,      2) for _ in range(4)])
 
-        self.output   = nn.Conv2d(dim * 2, out_channels, 3, 1, 1, bias=True)
+        # output: Conv2d(dim, 1) with bias  -> [1,64,3,3]
+        self.output   = nn.Conv2d(dim, out_channels, 3, 1, 1, bias=True)
 
     def forward(self, inp):
         x   = self.patch_embed(inp)           # dim
@@ -154,10 +152,10 @@ class Restormer(nn.Module):
         e3  = self.encoder3(self.down2(e2))   # dim*4
         lat = self.latent(self.down3(e3))     # dim*8
 
-        # Decoder: upsample then concat skip — no reduce_chan
-        d3  = self.decoder3(torch.cat([self.up3(lat), e3], dim=1))   # dim*8
-        d2  = self.decoder2(torch.cat([self.up2(d3),  e2], dim=1))   # dim*4
-        d1  = self.decoder1(torch.cat([self.up1(d2),  e1], dim=1))   # dim*2
+        # Decoder: upsample then ADD skip (not concat — no reduce_chan in checkpoint)
+        d3  = self.decoder3(self.up3(lat) + e3)   # dim*4
+        d2  = self.decoder2(self.up2(d3)  + e2)   # dim*2
+        d1  = self.decoder1(self.up1(d2)  + e1)   # dim
 
         return self.output(d1) + inp
 
