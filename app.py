@@ -35,6 +35,9 @@ def postprocess_output(output_tensor):
     return img_float, img_uint8
 
 # --- MODEL DOWNLOAD (Using gdown) ---
+# --- IMPORTANT: You must paste your 'class Restormer(nn.Module):' definition here ---
+# This code is NOT in the sources and must be copied from your development files.
+
 @st.cache_resource
 def load_neurorefine_model():
     file_id = '1VW-F-SLnxhFg1Pvtv5sx44xQYo3c2v5B'
@@ -42,23 +45,25 @@ def load_neurorefine_model():
     output = 'neurorefine_model.pth'
     
     if not os.path.exists(output):
-        with st.spinner("Downloading NeuroRefine model from Google Drive..."):
+        with st.spinner("Downloading weights..."):
             gdown.download(url, output, quiet=False)
     
-    # NOTE: You must define your model architecture class (e.g., Restormer) 
-    # before loading the state_dict. This is external to the sources [1, 2].
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Placeholder: Assuming the model is a scripted torch model or 
-    # you have the class defined here.
-    try:
-        model = torch.load(output, map_location=device)
-        model.eval()
-        return model, device
-    except Exception as e:
-        st.error(f"Error loading model: {e}. Ensure the architecture is defined.")
-        return None, device
-
+    # 1. Instantiate the architecture (Ensure parameters match your training)
+    # This architecture is used for Restormer inference [1].
+    model = Restormer() 
+    
+    # 2. Load the state_dict (the OrderedDict)
+    state_dict = torch.load(output, map_location=device)
+    
+    # 3. Load weights into the model
+    model.load_state_dict(state_dict)
+    
+    # 4. Set to evaluation mode
+    model.eval() # This will now work because 'model' is a torch.nn.Module, not a dict [1].
+    return model.to(device), device
+    
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="NeuroRefine AI", layout="wide")
 
