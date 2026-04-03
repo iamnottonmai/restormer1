@@ -117,7 +117,7 @@ class Restormer(nn.Module):
         self,
         inp_channels=1,
         out_channels=1,
-        dim=48,
+        dim=64,
         num_blocks=(4, 6, 6, 8),
         num_refinement_blocks=4,
         heads=(1, 2, 4, 8),
@@ -147,10 +147,11 @@ class Restormer(nn.Module):
         self.decoder_level2 = nn.Sequential(*[TransformerBlock(dim * 2, heads[1], ffn_expansion_factor, bias) for _ in range(num_blocks[1])])
 
         self.up2_1          = Upsample(dim * 2)
-        self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim * 2, heads[0], ffn_expansion_factor, bias) for _ in range(num_blocks[0])])
+        self.reduce_chan1   = nn.Conv2d(dim * 2, dim, 1, bias=bias)          # ← level-1 reduce
+        self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_expansion_factor, bias) for _ in range(num_blocks[0])])
 
-        self.refinement = nn.Sequential(*[TransformerBlock(dim * 2, heads[0], ffn_expansion_factor, bias) for _ in range(num_refinement_blocks)])
-        self.output     = nn.Conv2d(dim * 2, out_channels, 3, 1, 1, bias=bias)
+        self.refinement = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_expansion_factor, bias) for _ in range(num_refinement_blocks)])
+        self.output     = nn.Conv2d(dim, out_channels, 3, 1, 1, bias=bias)
 
     def forward(self, inp):
         inp_enc_l1 = self.patch_embed(inp)
@@ -174,7 +175,7 @@ class Restormer(nn.Module):
         out_dec_l2 = self.decoder_level2(inp_dec_l2)
 
         inp_dec_l1 = self.up2_1(out_dec_l2)
-        inp_dec_l1 = torch.cat([inp_dec_l1, out_enc_l1], dim=1)
+        inp_dec_l1 = self.reduce_chan1(torch.cat([inp_dec_l1, out_enc_l1], dim=1))  # ← reduce then decode
         out_dec_l1 = self.decoder_level1(inp_dec_l1)
 
         out = self.refinement(out_dec_l1)
@@ -184,7 +185,7 @@ class Restormer(nn.Module):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 MODEL_PATH = "Restormer_final.pth"
-GDRIVE_ID  = "1VW-F-SLnxhFg1Pvtv5sx44xQYo3c2v5B"
+GDRIVE_ID  = "1LVLEc1e_x5oSBwlaFpSESTKIB0meHDoq"
 
 
 def download_model():
@@ -209,20 +210,65 @@ def load_model():
         state = state["state_dict"]
     elif isinstance(state, dict) and "params" in state:
         state = state["params"]
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
     model.to(device).eval()
     return model, device
 
 
-def preprocess(uploaded_file, size: int = 256):
-    file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+def preprocess_mri(image_input, size: int = 256):
+    """
+    Preprocess a corrupted MRI image for Restormer inference.
+
+    Args:
+        image_input: file path (str) OR raw bytes from upload
+        size: resize target (default 256)
+
+    Returns:
+        tensor: (1, 1, size, size) float32 tensor ready for model
+        img_np: (size, size) numpy array for display
+    """
+    # ---- Load image ----
+    if isinstance(image_input, (str, bytes)):
+        if isinstance(image_input, str):
+            # File path
+            img = cv2.imread(image_input, cv2.IMREAD_GRAYSCALE)
+        else:
+            # Raw bytes
+            file_bytes = np.frombuffer(image_input, np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+    else:
+        raise ValueError("input must be file path or bytes")
+
     if img is None:
-        return None, None
+        raise ValueError("Failed to load image — check file format")
+
+    # ---- Resize ----
     img = cv2.resize(img, (size, size))
-    img_norm = img.astype(np.float32) / 255.0
-    tensor   = torch.from_numpy(img_norm).unsqueeze(0).unsqueeze(0)
-    return tensor, img_norm
+
+    # ---- Normalize to [0, 1] ----
+    img_np = img.astype(np.float32) / 255.0
+
+    # ---- Convert to tensor (1, 1, size, size) ----
+    tensor = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0)
+
+    return tensor, img_np
+
+
+def postprocess_output(output_tensor):
+    """
+    Convert model output tensor back to displayable numpy image.
+
+    Args:
+        output_tensor: (1, 1, H, W) model output
+
+    Returns:
+        img_float: numpy array (H, W) float32 in [0, 1]
+        img_uint8: numpy array (H, W) uint8 in [0, 255] for saving/display
+    """
+    img_float = output_tensor.cpu().squeeze().numpy()
+    img_float = np.clip(img_float, 0.0, 1.0)
+    img_uint8 = (img_float * 255).astype(np.uint8)
+    return img_float, img_uint8
 
 
 def fig_to_bytes(fig) -> bytes:
@@ -360,19 +406,19 @@ if uploaded is None:
 
 # ─── Preprocess ───────────────────────────────────────────────────────────────
 with st.spinner("Preprocessing image…"):
-    corrupted_tensor, corrupted_np = preprocess(uploaded, size=img_size)
-
-if corrupted_tensor is None:
-    st.error("Could not decode the uploaded image. Please try another file.")
-    st.stop()
+    try:
+        corrupted_tensor, corrupted_np = preprocess_mri(uploaded.read(), size=img_size)
+    except ValueError as e:
+        st.error(f"Could not decode the uploaded image: {e}")
+        st.stop()
 
 # ─── Inference ────────────────────────────────────────────────────────────────
 with st.spinner("Running Restormer inference…"):
     inp = corrupted_tensor.to(device)
     with torch.no_grad():
-        out = model(inp)
-        recon_dev = torch.clamp(out, 0.0, 1.0)
-    recon_np = recon_dev.cpu().squeeze().numpy()
+        residual = model(inp)
+        output   = torch.clamp(inp + residual, 0.0, 1.0)
+    recon_np, recon_uint8_inf = postprocess_output(output)
 
 diff_np = np.abs(recon_np - corrupted_np)
 
@@ -420,8 +466,7 @@ plt.close(fig)
 
 # ─── Download ─────────────────────────────────────────────────────────────────
 st.markdown("---")
-recon_uint8 = (recon_np * 255).clip(0, 255).astype(np.uint8)
-recon_pil   = Image.fromarray(recon_uint8, mode="L")
+recon_pil   = Image.fromarray(recon_uint8_inf, mode="L")
 buf = io.BytesIO()
 recon_pil.save(buf, format="PNG")
 buf.seek(0)
